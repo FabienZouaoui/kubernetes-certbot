@@ -1,16 +1,24 @@
-FROM		registry.sirdata.fr/alpine-kubectl:v4
+FROM		registry.sirdata.fr/alpine-kubectl:v29
 MAINTAINER	Fabien Zouaoui <fzo@sirdata.fr>
 LABEL		Description="Base alpine with certbot to renew certificates"
 
-RUN mkdir /run/nginx
+RUN mkdir -p /run/nginx
 
+#RUN echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
 RUN apk update && \
-	apk add certbot nginx bash openssl ca-certificates \
-	mariadb-client whois bind-tools wget python3 && \
-	update-ca-certificates && \
-	rm -f /var/cache/apk/*
+	apk add nginx bash openssl ca-certificates \
+	mariadb-client whois bind-tools wget python3 py3-pip && \
+	rm -f /var/cache/apk/* && \
+	update-ca-certificates
 
-RUN pip3 install --upgrade pip && pip3 install kubernetes
+RUN apk add gcc python3-dev musl-dev libffi-dev openssl-dev rust cargo \
+	py3-six py3-requests py3-distro && rm -f /var/cache/apk/*
+RUN pip3 install --upgrade pip
+RUN pip3 install --upgrade cryptography
+RUN pip3 install --no-cache certbot
+RUN rm -rf /root/.cache
+RUN apk del gcc python3-dev musl-dev libffi-dev openssl-dev py3-pip rust cargo && \
+	rm -f /var/cache/apk/*
 
 COPY run.sh                   /run.sh
 COPY renew-or-create-certs.sh /renew-or-create-certs.sh

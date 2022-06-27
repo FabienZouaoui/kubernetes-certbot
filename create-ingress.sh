@@ -5,6 +5,7 @@
 
 TEMPLATE="$(dirname ${0})/template-ingress.yml"
 DEST_DIR='/dev/shm/auto-ingresses'
+INGRESS_API_VERSION='extensions/v1beta1'
 RUN_KUBECTL=0
 
 function get_hostnames()
@@ -27,6 +28,7 @@ for HOSTNAME in $(get_hostnames); do
 	ING_NAME=${HOSTNAME//./-}
 	SECRET_NAME="${ING_NAME}-tls-secret-ingress"
 	sed \
+		-e "s/{INGRESS_API_VERSION}/${INGRESS_API_VERSION}/g" \
 		-e "s/{ING_NAME}/${ING_NAME}/g" \
 		-e "s/{SECRET_NAME}/${SECRET_NAME}/g" \
 		-e "s/{HOSTNAME}/${HOSTNAME}/g" \

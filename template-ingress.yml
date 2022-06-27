@@ -1,8 +1,9 @@
 ---
-apiVersion: extensions/v1beta1
+apiVersion: {INGRESS_API_VERSION}
 kind: Ingress
 metadata:
   name: {ING_NAME}
+  namespace: {NAMESPACE}
   annotations:
     kubernetes.io/ingress.class: "nginx"
     ingress.kubernetes.io/ssl-redirect: "false" 
@@ -21,5 +22,5 @@ spec:
           servicePort: 80
       - path: /
         backend:
-          serviceName: default-www
+          serviceName: nginx-redirect-to-js
           servicePort: 80

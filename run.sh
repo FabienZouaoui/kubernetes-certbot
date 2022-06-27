@@ -1,6 +1,7 @@
 #!/bin/bash
 
-#TODO: Ajouter des gardes fou supplémentaires pour ne pas se faire blacklister par letsencrypt (voir leur CGU)
+# Écrit par Fabien Zouaoui
+# Gère la création et le renouvellement de domaines et certficats
 
 # Vars defined in kube file
 declare -a NEEDED_VARS
@@ -18,17 +19,30 @@ NEEDED_VARS+=('MYSQL_DATABASE')
 NEEDED_VARS+=('GANDI_API_KEY')
 NEEDED_VARS+=('GANDI_HANDLE')
 NEEDED_VARS+=('CNAME_TARGET')
+NEEDED_VARS+=('GET_HOSTS_FROM_MYSQL')
+NEEDED_VARS+=('NS_FOR_MYSQL_HOSTS')
+NEEDED_VARS+=('CONTACT_EMAIL')
 
-CUSTOM_DNS_SRV='8.8.8.8'
+CUSTOM_DNS_SRV='1.1.1.1'
 TMP_INGRESS_DIR='/dev/shm/auto-ingresses'
 ING_TEMPLATE="$(dirname ${0})/template-ingress.yml"
 TMP_CERTFILE='/dev/shm/certfile'
 WEBROOT='/var/lib/nginx/html'
-CERTS_DIR='/etc/letsencrypt/live'
+declare -A CERTS_DIR
+CERTS_DIR['letsencrypt']='/etc/letsencrypt/live'
+#CERTS_DIR['ssl.com']='/etc/ssl-com/live'
 COLLECTOR_DIR='/var/lib/node_exporter_collector'
+DEFAULT_INGRESS_API_VERSION='extensions/v1beta1'
 declare -i LOOP_NUM=0
+declare -i RET_VALUE=0
 
 declare HOSTNAMES
+declare INGRESS_API_VERSION
+declare -A NAMESPACES
+declare -A INGRESS_NAMES
+declare -A ERRONEOUS_PARTNERS_HOSTNAMES
+declare -A PARTNERS_HOSTNAMES
+declare -A SSL_PROVIDER
 
 function die()
 {
@@ -54,11 +68,16 @@ function check_prerequesties()
 	(( "${#err[*]}" )) > 0 && \
 		die "Error, the following variables are not set: ${err[*]}"
 	
-	test -d ${CERTS_DIR} || \
-		die "Error: ${CERTS_DIR} directory is unavailable"
+	for provider in ${!CERTS_DIR[*]}; do
+		test -d ${CERTS_DIR[${provider}]} || \
+			die "Error: ${CERTS_DIR[${provider}]} directory is unavailable"
+	done
 	
 	test -f ${ING_TEMPLATE} || \
 		die "Error: ${ING_TEMPLATE} file is unavailable"
+
+	test -z "${INGRESS_API_VERSION}" && \
+		INGRESS_API_VERSION="${DEFAULT_INGRESS_API_VERSION}"
 }
 
 function stop_nginx()
@@ -89,6 +108,8 @@ EOF
 
 function get_needed_hostnames()
 {
+	${GET_HOSTS_FROM_MYSQL} || return 0
+
 	mysql -BN \
 		-h ${MYSQL_SERVER} \
 		-u ${MYSQL_USERNAME} \
@@ -100,23 +121,28 @@ function get_needed_hostnames()
 function update_hostname_status()
 {
         local hostname=${1}
+	local status=${2}
+
+	(( ${status} == 1 )) || echo "Marking ${hostname} as non active"
 
 	mysql -BN \
 		-h ${MYSQL_SERVER} \
 		-u ${MYSQL_USERNAME} \
 		-p${MYSQL_PASSWORD} \
-		-e "update ${TABLE} set ${AVAIL_ROW} = 1 WHERE domain_name = '${hostname}' " \
+		-e "update ${TABLE} set ${AVAIL_ROW} = ${status} WHERE domain_name = '${hostname}' " \
 		${MYSQL_DATABASE}
 }
 
 function generate_ingress_file()
 {
-	local hostname=${1}
+	local namespace=${1}
+	local hostname=${2}
 	local ingname=${hostname//./-}
 	local secretname="${ingname}-tls-secret-ingress"
-	local template=${2}
+	local template=${3}
 
 	sed \
+		-e "s/{INGRESS_API_VERSION}/${INGRESS_API_VERSION}/g" \
 		-e "s/{ING_NAME}/${ingname}/g" \
 		-e "s/{SECRET_NAME}/${secretname}/g" \
 		-e "s/{HOSTNAME}/${hostname}/g" \
@@ -128,7 +154,24 @@ function check_hostname()
 {
 	local hostname=${1}
 
-	host ${hostname} ${CUSTOM_DNS_SRV} &> /dev/null
+	#if ! host ${hostname} ${CUSTOM_DNS_SRV} &> /dev/null ; then
+	if ! host ${hostname} &> /dev/null ; then
+		echo "Could not resolve ${hostname}"
+		return 1
+	fi
+
+	# Unfortunatelly, some partners are using reverse proxies to redirect traffic to us, so we should only verifiy this when we own the domain
+	if [ "$2" == 'CNAME' -a "$(host -t CNAME ${hostname} | awk -v HOSTNAME="${hostname}" '($1==HOSTNAME) {print $6}')" != "${CNAME_TARGET}." ]; then 
+		echo "${hostname} is not a CNAME pointing to ${CNAME_TARGET}."
+		return 1
+	fi
+	
+	[ "${2}" == 'DNSONLY' -o "${2}" == 'CNAME' ] && return 0
+
+	if [ "$(wget --no-check-certificate --timeout=1 --tries=3 --retry-on-host-error -q -O - https://${hostname}/.well-known/acme-challenge/$(hostname).txt 2> /dev/null)" != 'ok' ]; then
+		echo "Could not download https://${hostname}/.well-known/acme-challenge/$(hostname).txt"
+		return 1
+	fi
 }
 
 function extract_domain_name()
@@ -147,14 +190,32 @@ function domain_is_registered()
 	whois ${domain} | grep -qE 'Domain Name:|domain:'
 }
 
+function domain_need_renewal()
+{
+	local domain=${1}
+	local expire=$(date -d $(whois ${domain} | awk -F ':' '($1~"^ *Registry Expiry Date") {gsub("T.*$", "", $2) ; print $2}') +%s)
+
+	if [ -z "${expire}" ]; then
+		echo "Unable to find expiration date for this domain. Skipping renewal"
+		return 1
+	fi
+	
+	if (( (${expire} - $(date +%s)) < ${MIN_EXPIRATION} )); then
+		return 0
+	fi
+	
+	return 1
+}
+
 function check_certificate_expiration()
 {
-	local secret=${1}
-	local hostname=${2}
-	local ingress=${3}
+	local namespace=${1}
+	local secret=${2}
+	local hostname=${3}
+	local ingress=${4}
 	local expire
 
-	kubectl get secrets ${secret} -o yaml \
+	kubectl --namespace=${namespace} get secrets ${secret} -o yaml \
 		| awk '($1=="tls.crt:") { print $2}' \
 		| base64 -d \
 		> ${TMP_CERTFILE}
@@ -182,49 +243,109 @@ function check_certificate_expiration()
 
 function i_have_cert()
 {
-	[ -d ${CERTS_DIR}/${1} ]
+	local hostname=${1}
+	local provider=${2}
+
+	[ -d ${CERTS_DIR[${provider}]}/${hostname} ]
 }
 
 function update_cert()
 {
-	#certbot renew
-	certbot certonly -n --text --webroot --webroot-path ${WEBROOT} -d ${1}
+	local hostname=${1}
+	local provider=${2}
+
+	if [[ "${provider}" == 'ssl.com' ]]; then
+		certbot certonly -n -m ${SSLCOM_EMAIL} --text --config-dir /etc/ssl-com --logs-dir /var/log/ssl-com --webroot --webroot-path ${WEBROOT} \
+			--eab-kid ${SSLCOM_ACCOUNT_KEY} --eab-hmac-key ${SSLCOM_HMAC_KEY} --server https://acme.ssl.com/sslcom-dv-rsa -d ${hostname}
+		return ${?}
+	fi
+
+	#certbot certonly -n --text --preferred-chain "DST Root CA X3" --webroot --webroot-path ${WEBROOT} -d ${hostname}
+	certbot certonly -n --text --webroot --webroot-path ${WEBROOT} -d ${hostname}
 }
 
 function create_cert()
 {
-	certbot certonly --text --webroot --webroot-path ${WEBROOT} -d ${1}
+	local hostname=${1}
+	local provider=${2}
+
+	if [[ "${provider}" == 'ssl.com' ]]; then
+		certbot certonly -n -m ${SSLCOM_EMAIL} --agree-tos --no-eff-email --text \
+			--config-dir /etc/ssl-com --logs-dir /var/log/ssl-com --webroot --webroot-path ${WEBROOT} \
+			--eab-kid ${SSLCOM_ACCOUNT_KEY} --eab-hmac-key ${SSLCOM_HMAC_KEY} --server https://acme.ssl.com/sslcom-dv-rsa -d ${hostname}
+		return ${?}
+	fi
+
+	#certbot certonly -n -m ${CONTACT_EMAIL} --agree-tos --no-eff-email --text --preferred-chain "DST Root CA X3" --webroot --webroot-path ${WEBROOT} -d ${hostname}
+	certbot certonly -n -m ${CONTACT_EMAIL} --agree-tos --no-eff-email --text --webroot --webroot-path ${WEBROOT} -d ${hostname}
 }
 
 function update_secret()
 {
-	local name=${1}
-	local ing
+	local namespace=${1}
+	local ing=${2}
+	local host_name=${3}
+	local provider=${4}
 	local sec
 
-	[ -f ${CERTS_DIR}/${name}/fullchain.pem -a -f ${CERTS_DIR}/${name}/privkey.pem ] \
+	[ -f ${CERTS_DIR[${provider}]}/${host_name}/fullchain.pem -a -f ${CERTS_DIR[${provider}]}/${host_name}/privkey.pem ] \
 		|| die "Impossible d'accèder au certificat et/ou à la clé"
 
-	ing=$(kubectl get ingress | awk -v NAME=${name} '($2==NAME) {print $1}')
-	[ -z "${ing}" ] && die "Impossible de trouver la regle ingress pour ${name}"
+	#ing=$(kubectl --namespace=${namespace} get ingress \
+	#	-o custom-columns="NAME:..metadata.name,HOSTS:..spec.rules[0].host" --no-headers \
+	#	| awk -v NAME=${host_name} '($2==NAME) {print $1}')
+	#[ -z "${ing}" ] && die "Impossible de trouver la regle ingress pour ${host_name}"
 
-	sec=$(kubectl get ingress ${ing} --output=jsonpath="{..secretName}")
-	[ -z "${sec}" ] && die "Impossible de trouver le secret ${name} (ingress ${ing})"
+	sec=$(kubectl --namespace=${namespace} get ingress ${ing} --output=jsonpath="{..secretName}")
+	[ -z "${sec}" ] && die "Impossible de trouver le secret ${host_name} (ingress ${ing})"
 
-	kubectl delete secret ${sec} 2> /dev/null
-	kubectl create secret generic ${sec} \
-		--from-file=tls.crt=${CERTS_DIR}/${name}/fullchain.pem \
-		--from-file=tls.key=${CERTS_DIR}/${name}/privkey.pem
+	kubectl --namespace=${namespace} delete secret ${sec} 2> /dev/null
+	kubectl --namespace=${namespace} create secret generic ${sec} \
+		--from-file=tls.crt=${CERTS_DIR[${provider}]}/${host_name}/fullchain.pem \
+		--from-file=tls.key=${CERTS_DIR[${provider}]}/${host_name}/privkey.pem
 }
 
-echo "Sleeping a bit to avoid restart storm"
-sleep 15
+function disable_withelist_source_range()
+{
+	local namespace=${1}
+	local ingress=${2}
+	local ranges
+
+	ranges=$(kubectl --namespace=${namespace} get ingress ${ingress} \
+		--output=jsonpath="{.metadata.annotations.nginx\.ingress\.kubernetes\.io/whitelist-source-range}" \
+		2> /dev/null)
+
+	if [[ -n "${ranges}" && "${ranges%% *}" != 'Error' ]]; then
+		echo "Disabling withelist source range annotation for ingress ${ingress} in namespace ${namespace}" >&2
+		kubectl --namespace=${namespace} annotate ingress ${ingress} nginx.ingress.kubernetes.io/whitelist-source-range- >&2
+		sleep 10
+		echo ${ranges}
+		return 0
+	fi
+}
+
+function reenable_withelist_source_range()
+{
+	local namespace=${1}
+	local ingress=${2}
+	local ranges=${3}
+
+	[ -z "${ranges}" ] && return 0
+
+	echo "Re-enabling withelist source range annotation for ingress ${ingress} in namespace ${namespace}"
+	kubectl --namespace=${namespace} annotate ingress ${ingress} nginx.ingress.kubernetes.io/whitelist-source-range=${ranges}
+}
+
 check_prerequesties
 restart_nginx
+echo "Sleeping a bit to avoid restart storm and letting ingress to redirect traffic here"
+sleep 75
 
 # Create an arbitrary file to check that queries to hostnames are reaching this pod
 mkdir -p ${WEBROOT}/.well-known/acme-challenge
 echo 'ok' > ${WEBROOT}/.well-known/acme-challenge/$(hostname).txt
+
+(( ${DEBUG:-0} > 0)) && set -x
 
 while true; do
 	((LOOP_NUM++))
@@ -232,12 +353,18 @@ while true; do
 	mkdir -p ${TMP_INGRESS_DIR}
 	rm -f ${TMP_INGRESS_DIR-foolproof}/*
 	RUN_KUBECTL=0
+	unset ERRONEOUS_PARTNERS_HOSTNAMES
+	RET_VALUE=0
+	declare -A ERRONEOUS_PARTNERS_HOSTNAMES
 	for HOST_NAME in $(get_needed_hostnames); do
+		PARTNERS_HOSTNAMES["${HOST_NAME}"]='yes'
+		CHECK_MODE='full'
+		sleep 1
 		if echo ${HOST_NAME} | grep -qE ${SIRDATA_DOMAINS_PATTERN}; then
-			if ! check_hostname ${HOST_NAME}; then
-				echo "Hostname ${HOST_NAME} does not resolve"
 
-                                DOMAIN=$(extract_domain_name ${HOST_NAME})
+			DOMAIN=$(extract_domain_name ${HOST_NAME})
+			if ! check_hostname ${HOST_NAME} 'CNAME'; then
+
 				if ! domain_is_registered ${DOMAIN}; then
 					echo "Domain is not registered. Trying to register it"
                                         /domain-managment.py \
@@ -256,69 +383,110 @@ while true; do
                                     --record "${HOST_NAME%%.*}" \
                                     --rtype   'CNAME' \
                                     --rtarget "${CNAME_TARGET}"
+
+			elif domain_need_renewal ${DOMAIN}; then
+				/domain-managment.py \
+					--api_key "${GANDI_API_KEY}" \
+					--handle  "${GANDI_HANDLE}" \
+					--domain "${DOMAIN}" \
+					--action 'renew'
 			fi
 		fi
-		check_hostname ${HOST_NAME} && update_hostname_status ${HOST_NAME}
 
-		if kubectl get ingress | grep -q "${HOST_NAME}"; then
-			echo "Hostname ${HOST_NAME} already has an ingress rule"
-			continue
+		if ! kubectl --namespace=${NS_FOR_MYSQL_HOSTS} get ingress | grep -q "${HOST_NAME}"; then
+			generate_ingress_file ${NS_FOR_MYSQL_HOSTS} ${HOST_NAME} ${ING_TEMPLATE} \
+				> ${TMP_INGRESS_DIR}/${HOST_NAME}.yml
+			RUN_KUBECTL=1
+			CHECK_MODE='DNSONLY'
 		fi
-		generate_ingress_file ${HOST_NAME} ${ING_TEMPLATE} \
-			> ${TMP_INGRESS_DIR}/${HOST_NAME}.yml
-		RUN_KUBECTL=1
 
+		if check_hostname ${HOST_NAME} ${CHECK_MODE}; then
+			update_hostname_status ${HOST_NAME} 1
+		else
+			update_hostname_status ${HOST_NAME} 0
+			ERRONEOUS_PARTNERS_HOSTNAMES["${HOST_NAME}"]='error'
+		fi
 	done
 	[ ${RUN_KUBECTL} -eq 1 ] && \
 		kubectl create -f ${TMP_INGRESS_DIR}
 
 	HOSTNAMES=''
-	for ingress in $(kubectl get ingress -o jsonpath="{..metadata.name}"); do
-		echo ''
-		rm -f ${TMP_CERTFILE}
+	for namespace in $(kubectl get namespaces -o jsonpath="{..metadata.name}"); do
+		[ -z "$(kubectl --namespace=${namespace} get ingress)" ] && continue
+		for ingress in $(kubectl --namespace=${namespace} get ingress -o jsonpath="{..metadata.name}"); do
+			echo ''
+			rm -f ${TMP_CERTFILE}
 
-		HOST_NAME=$(kubectl get ingress ${ingress} -o jsonpath="{..rules..host}")
-		if [ -z "${HOST_NAME}" ]; then
-			echo "Unable to find hostname for ingress \"${ingress}\""
-			continue
-		fi
+			HOST_NAME=$(kubectl --namespace=${namespace} get ingress ${ingress} -o jsonpath="{..rules..host}")
+			if [ -z "${HOST_NAME}" ]; then
+				echo "Unable to find hostname for ingress \"${ingress}\""
+				continue
+			fi
 
-		SECRET=$(kubectl get ingress ${ingress} -o jsonpath="{..tls..secretName}" 2> /dev/null)
-		if [ -z "${SECRET}" ]; then
-			echo "Unable to find secret name for ingress \"${ingress}\""
-			continue
-		fi
+			SECRET=$(kubectl --namespace=${namespace} get ingress ${ingress} -o jsonpath="{..tls..secretName}" 2> /dev/null)
+			if [ -z "${SECRET}" ]; then
+				echo "Unable to find secret name for ingress \"${ingress}\""
+				continue
+			fi
+			ssl_provider=$(kubectl --namespace=${namespace} get ingress ${ingress} -o jsonpath="{.metadata.annotations.ssl-provider}" 2> /dev/null)
+			if (( ${?} != 0 )); then
+				ssl_provider=''
+			fi
 
-		if ! $(wget --no-check-certificate -q --spider http://${HOST_NAME}/.well-known/acme-challenge/$(hostname).txt 2> /dev/null); then
-			echo "Could not validate that \"${HOST_NAME}\" is pointing to me. Aborting !"
-			continue
-		fi
+			if [[ "${ERRONEOUS_PARTNERS_HOSTNAMES[${HOST_NAME}]}" == 'error' ]]; then
+				echo "Skipping ${HOST_NAME} due to previous error !"
+				#RET_VALUE=1 # Some hosts are unconfigured for a long time, so I'm stopping to consider this an error.
+				continue
+			fi
 
-		check_certificate_expiration ${SECRET} ${HOST_NAME} ${ingress} \
-			|| continue
+			check_certificate_expiration ${namespace} ${SECRET} ${HOST_NAME} ${ingress} \
+				|| continue
 
-		HOSTNAMES+=" ${HOST_NAME}"
+			whitelist_ranges=$(disable_withelist_source_range ${namespace} ${ingress})
+			if ! check_hostname ${HOST_NAME} ; then
+				[ "${PARTNERS_HOSTNAMES[${HOST_NAME}]}" != 'yes' ] && \
+					echo "Please check that  ingress for \"${HOST_NAME}\" is still needed"
+				RET_VALUE=1
+				reenable_withelist_source_range ${namespace} ${ingress} ${whitelist_ranges}
+				continue
+			fi
+			reenable_withelist_source_range ${namespace} ${ingress} ${whitelist_ranges}
+
+			HOSTNAMES+=" ${HOST_NAME}"
+			NAMESPACES[${HOST_NAME}]=${namespace}
+			INGRESS_NAMES[${HOST_NAME}]=${ingress}
+			SSL_PROVIDER[${HOST_NAME}]=${ssl_provider:-letsencrypt}
+		done
 	done
 
 	if [ -n "${HOSTNAMES}" ]; then
 		echo -e "\n\nRenewing or creating cert(s) for ${HOSTNAMES}"
 		for HOST_NAME in ${HOSTNAMES}; do
-			if i_have_cert ${HOST_NAME} ; then
-				update_cert ${HOST_NAME}
+			whitelist_ranges=$(disable_withelist_source_range ${NAMESPACES[${HOST_NAME}]} ${INGRESS_NAMES[${HOST_NAME}]})
+			if i_have_cert ${HOST_NAME} ${SSL_PROVIDER[${HOST_NAME}]} ; then
+				update_cert ${HOST_NAME} ${SSL_PROVIDER[${HOST_NAME}]}
 			else
-				create_cert ${HOST_NAME}
+				create_cert ${HOST_NAME} ${SSL_PROVIDER[${HOST_NAME}]}
 			fi
 			if (( ${?} == 0 )); then
-				update_secret ${HOST_NAME}
+				update_secret ${NAMESPACES[${HOST_NAME}]} ${INGRESS_NAMES[${HOST_NAME}]} ${HOST_NAME} ${SSL_PROVIDER[${HOST_NAME}]}
 			else
+				RET_VALUE=1
 				echo "Erreur lors de la création / renouvellement du certificat" 2>&1
 			fi
+			reenable_withelist_source_range ${NAMESPACES[${HOST_NAME}]} ${INGRESS_NAMES[${HOST_NAME}]} ${whitelist_ranges}
 		done
 	else
 		echo -e "\n\nNothing to do :)"
 	fi
 
-	echo "certbot_run_time{ret=\"0\"} $(date +%s)" \
+
+	for CLUSTER in $(grep search /etc/resolv.conf); do
+		true
+	done
+	[ -z "${CLUSTER}" ] && CLUSTER='unknown'
+
+	echo "certbot_run_time{cluster=\"${CLUSTER}\",ret=\"${RET_VALUE}\"} $(date +%s)" \
 		>> ${COLLECTOR_DIR}/certbot_run_time.prom.$$
 	mv ${COLLECTOR_DIR}/certbot_run_time.prom.$$ ${COLLECTOR_DIR}/certbot_run_time.prom
 
